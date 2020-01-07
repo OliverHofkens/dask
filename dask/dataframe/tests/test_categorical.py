@@ -342,6 +342,15 @@ def test_return_type_known_categories():
     assert isinstance(ret_type, dd.core.Series)
 
 
+@pytest.mark.parametrize("ordered", [True, False])
+def test_unique_categorical(ordered):
+    # https://github.com/dask/dask/issues/5676
+    pdf = pd.DataFrame({"cat": pd.Categorical(list("AABBCC"), ordered=ordered)})
+    ddf = dd.from_pandas(pdf, npartitions=3)
+
+    assert_eq(pdf["cat"].unique(), ddf["cat"].unique())
+
+
 class TestCategoricalAccessor:
     @pytest.mark.parametrize("series", cat_series)
     @pytest.mark.parametrize(
