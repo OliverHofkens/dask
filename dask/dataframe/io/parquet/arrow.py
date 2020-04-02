@@ -1,10 +1,12 @@
 from functools import partial
 from collections import OrderedDict
 import json
+import warnings
 
 import pandas as pd
 import pyarrow as pa
 import pyarrow.parquet as pq
+from pyarrow.compat import guid
 from ....utils import natural_sort_key, getargspec
 from ..utils import _get_pyarrow_dtypes, _meta_from_dtypes
 from ...utils import clear_known_categories
@@ -31,7 +33,7 @@ def _get_md_row_groups(pieces):
             row_group = piece.get_metadata().row_group(rg)
             for c in range(row_group.num_columns):
                 if not row_group.column(c).statistics:
-                    return []
+                    return (None, None)
             row_groups.append(row_group)
         row_groups_per_piece.append(num_row_groups)
     if len(row_groups) == len(pieces):
@@ -59,6 +61,37 @@ def _get_row_groups_per_piece(pieces, metadata, path, fs):
         else:
             return None  # File path is missing, abort
     return tuple(result.values())
+
+
+def _merge_statistics(stats, s):
+    """ Update `stats` with vaules in `s`
+    """
+    stats[-1]["total_byte_size"] += s["total_byte_size"]
+    stats[-1]["num-rows"] += s["num-rows"]
+    ncols = len(stats[-1]["columns"])
+    ncols_n = len(s["columns"])
+    if ncols != ncols_n:
+        raise ValueError(f"Column count not equal ({ncols} vs {ncols_n})")
+    for i in range(ncols):
+        name = stats[-1]["columns"][i]["name"]
+        j = i
+        for ii in range(ncols):
+            if name == s["columns"][j]["name"]:
+                break
+            if ii == ncols - 1:
+                raise KeyError(f"Column statistics missing for {name}")
+            j = (j + 1) % ncols
+
+        min_n = s["columns"][j]["min"]
+        max_n = s["columns"][j]["max"]
+        null_count_n = s["columns"][j]["null_count"]
+
+        min_i = stats[-1]["columns"][i]["min"]
+        max_i = stats[-1]["columns"][i]["max"]
+        stats[-1]["columns"][i]["min"] = min(min_i, min_n)
+        stats[-1]["columns"][i]["max"] = min(max_i, max_n)
+        stats[-1]["columns"][i]["null_count"] += null_count_n
+    return True
 
 
 def _determine_dataset_parts(fs, paths, gather_statistics, filters, dataset_kwargs):
@@ -119,6 +152,55 @@ def _determine_dataset_parts(fs, paths, gather_statistics, filters, dataset_kwar
     return parts, dataset
 
 
+def _write_partitioned(
+    table, root_path, partition_cols, fs, preserve_index=True, **kwargs
+):
+    """ Write table to a partitioned dataset with pyarrow.
+
+        Logic copied from pyarrow.parquet.
+        (arrow/python/pyarrow/parquet.py::write_to_dataset)
+
+        TODO: Remove this in favor of pyarrow's `write_to_dataset`
+              once ARROW-8244 is addressed.
+    """
+    fs.mkdirs(root_path, exist_ok=True)
+
+    df = table.to_pandas(ignore_metadata=True)
+    partition_keys = [df[col] for col in partition_cols]
+    data_df = df.drop(partition_cols, axis="columns")
+    data_cols = df.columns.drop(partition_cols)
+    if len(data_cols) == 0 and not preserve_index:
+        raise ValueError("No data left to save outside partition columns")
+
+    subschema = table.schema
+    for col in table.schema.names:
+        if col in partition_cols:
+            subschema = subschema.remove(subschema.get_field_index(col))
+
+    md_list = []
+    for keys, subgroup in data_df.groupby(partition_keys):
+        if not isinstance(keys, tuple):
+            keys = (keys,)
+        subdir = fs.sep.join(
+            [
+                "{colname}={value}".format(colname=name, value=val)
+                for name, val in zip(partition_cols, keys)
+            ]
+        )
+        subtable = pa.Table.from_pandas(
+            subgroup, preserve_index=False, schema=subschema, safe=False
+        )
+        prefix = fs.sep.join([root_path, subdir])
+        fs.mkdir(prefix, exists_ok=True)
+        outfile = guid() + ".parquet"
+        full_path = fs.sep.join([prefix, outfile])
+        with fs.open(full_path, "wb") as f:
+            pq.write_table(subtable, f, metadata_collector=md_list, **kwargs)
+        md_list[-1].set_file_path(fs.sep.join([subdir, outfile]))
+
+    return md_list
+
+
 class ArrowEngine(Engine):
     @staticmethod
     def read_metadata(
@@ -138,6 +220,15 @@ class ArrowEngine(Engine):
         parts, dataset = _determine_dataset_parts(
             fs, paths, gather_statistics, filters, kwargs.get("dataset", {})
         )
+        # Check if the column-chunk file_path's are set in "_metadata".
+        # If available, we can use the path to sort the row-groups
+        col_chunk_paths = False
+        if dataset.metadata:
+            col_chunk_paths = all(
+                dataset.metadata.row_group(i).column(0).file_path is not None
+                for i in range(dataset.metadata.num_row_groups)
+            )
+
         # TODO: Call to `_determine_dataset_parts` uses `pq.ParquetDataset`
         # to define the `dataset` object. `split_row_groups` should be passed
         # to that constructor once it is supported (see ARROW-2801).
@@ -145,10 +236,38 @@ class ArrowEngine(Engine):
             partitions = [
                 n for n in dataset.partitions.partition_names if n is not None
             ]
-            if partitions:
-                split_row_groups = False
+            if partitions and dataset.metadata:
+                # Dont use dataset.metadata for partitioned datasets, unless
+                # the column-chunk metadata includes the `"file_path"`.
+                # The order of dataset.metadata.row_group items is often
+                # different than the order of `dataset.pieces`.
+                if not col_chunk_paths or (
+                    len(dataset.pieces) != dataset.metadata.num_row_groups
+                ):
+                    dataset.schema = dataset.metadata.schema
+                    dataset.metadata = None
         else:
             partitions = []
+
+        # Statistics are currently collected at the row-group level only.
+        # Therefore, we cannot perform filtering with split_row_groups=False.
+        # For "partitioned" datasets, each file (usually) corresponds to a
+        # row-group anyway.
+        # TODO: Map row-group statistics onto file pieces for filtering.
+        #       This shouldn't be difficult if `col_chunk_paths==True`
+        if not split_row_groups and not col_chunk_paths:
+            if gather_statistics is None and not partitions:
+                gather_statistics = False
+                if filters:
+                    raise ValueError(
+                        "Filters not supported with split_row_groups=False "
+                        "(unless proper _metadata is available)."
+                    )
+            if gather_statistics and not partitions:
+                raise ValueError(
+                    "Statistics not supported with split_row_groups=False."
+                    "(unless proper _metadata is available)."
+                )
 
         if dataset.metadata:
             schema = dataset.metadata.schema.to_arrow_schema()
@@ -168,6 +287,13 @@ class ArrowEngine(Engine):
                 storage_name_mapping,
                 column_index_names,
             ) = _parse_pandas_metadata(pandas_metadata)
+            if categories is None:
+                categories = []
+                for col in pandas_metadata["columns"]:
+                    if (col["pandas_type"] == "categorical") and (
+                        col["name"] not in categories
+                    ):
+                        categories.append(col["name"])
         else:
             index_names = []
             column_names = schema.names
@@ -208,11 +334,23 @@ class ArrowEngine(Engine):
         if (
             gather_statistics is None
             and dataset.metadata
-            and dataset.metadata.num_row_groups == len(pieces)
+            and dataset.metadata.num_row_groups >= len(pieces)
         ):
             gather_statistics = True
         if not pieces:
             gather_statistics = False
+
+        if filters:
+            # Filters may require us to gather statistics
+            if gather_statistics is False and partitions:
+                warnings.warn(
+                    "Filtering with gather_statistics=False. "
+                    "Only partition columns will be filtered correctly."
+                )
+            elif gather_statistics is False:
+                raise ValueError("Cannot apply filters with gather_statistics=False")
+            elif not gather_statistics:
+                gather_statistics = True
 
         row_groups_per_piece = None
         if gather_statistics:
@@ -222,6 +360,16 @@ class ArrowEngine(Engine):
                     dataset.metadata.row_group(i)
                     for i in range(dataset.metadata.num_row_groups)
                 ]
+
+                # Re-order row-groups by path name if known
+                if col_chunk_paths:
+                    row_groups = sorted(
+                        row_groups,
+                        key=lambda row_group: natural_sort_key(
+                            row_group.column(0).file_path
+                        ),
+                    )
+
                 if split_row_groups and len(dataset.paths) == 1:
                     row_groups_per_piece = _get_row_groups_per_piece(
                         pieces, dataset.metadata, dataset.paths[0], fs
@@ -240,6 +388,7 @@ class ArrowEngine(Engine):
         if gather_statistics:
             stats = []
             skip_cols = set()  # Columns with min/max = None detected
+            path_last = None
             for ri, row_group in enumerate(row_groups):
                 s = {"num-rows": row_group.num_rows, "columns": []}
                 for i, name in enumerate(names):
@@ -264,6 +413,17 @@ class ArrowEngine(Engine):
                             )
                         s["columns"].append(d)
                 s["total_byte_size"] = row_group.total_byte_size
+                if col_chunk_paths:
+                    s["file_path_0"] = row_group.column(0).file_path
+                    if not split_row_groups and (s["file_path_0"] == path_last):
+                        # Rather than appending a new "row-group", just merge
+                        # new `s` statistics into last element of `stats`.
+                        # Note that each stats element will now correspond to an
+                        # entire file (rather than actual "row-groups")
+                        _merge_statistics(stats, s)
+                        continue
+                    else:
+                        path_last = s["file_path_0"]
                 stats.append(s)
         else:
             stats = None
@@ -297,7 +457,8 @@ class ArrowEngine(Engine):
                         parts.append((piece.path, rg, piece.partition_keys))
                         # Setting file_path here, because it may be
                         # missing from the row-group/column-chunk stats
-                        stats[rg_tot]["file_path_0"] = piece.path
+                        if "file_path_0" not in stats[rg_tot]:
+                            stats[rg_tot]["file_path_0"] = piece.path
                         rg_tot += 1
             else:
                 parts = [
@@ -319,7 +480,12 @@ class ArrowEngine(Engine):
         fs, piece, columns, index, categories=(), partitions=(), **kwargs
     ):
         if isinstance(index, list):
-            columns += index
+            for level in index:
+                # unclear if we can use set ops here. I think the order matters.
+                # Need the membership test to avoid duplicating index when
+                # we slice with `columns` later on.
+                if level not in columns:
+                    columns.append(level)
         if isinstance(piece, str):
             # `piece` is a file-path string
             piece = pq.ParquetDatasetPiece(
@@ -335,6 +501,16 @@ class ArrowEngine(Engine):
                 open_file_func=partial(fs.open, mode="rb"),
             )
 
+        # Ensure `columns` and `partitions` do not overlap
+        columns_and_parts = columns.copy()
+        if columns_and_parts and partitions:
+            for part_name in partitions.partition_names:
+                if part_name in columns:
+                    columns.remove(part_name)
+                else:
+                    columns_and_parts.append(part_name)
+            columns = columns or None
+
         df = piece.read(
             columns=columns,
             partitions=partitions,
@@ -342,7 +518,7 @@ class ArrowEngine(Engine):
             use_threads=False,
             **kwargs.get("read", {}),
         ).to_pandas(categories=categories, use_threads=False, ignore_metadata=True)[
-            list(columns)
+            list(columns_and_parts)
         ]
 
         if index:
@@ -459,22 +635,22 @@ class ArrowEngine(Engine):
         schema=None,
         **kwargs,
     ):
-        md_list = []
+        _meta = None
         preserve_index = False
         if index_cols:
             df = df.set_index(index_cols)
             preserve_index = True
         t = pa.Table.from_pandas(df, preserve_index=preserve_index, schema=schema)
         if partition_on:
-            pq.write_to_dataset(
-                t,
-                path,
-                partition_cols=partition_on,
-                filesystem=fs,
-                metadata_collector=md_list,
-                **kwargs,
+            md_list = _write_partitioned(
+                t, path, partition_on, fs, preserve_index=preserve_index, **kwargs
             )
+            if md_list:
+                _meta = md_list[0]
+                for i in range(1, len(md_list)):
+                    _meta.append_row_groups(md_list[i])
         else:
+            md_list = []
             with fs.open(fs.sep.join([path, filename]), "wb") as fil:
                 pq.write_table(
                     t,
@@ -484,10 +660,11 @@ class ArrowEngine(Engine):
                     **kwargs,
                 )
             if md_list:
-                md_list[0].set_file_path(filename)
+                _meta = md_list[0]
+                _meta.set_file_path(filename)
         # Return the schema needed to write the metadata
         if return_metadata:
-            return [{"schema": t.schema, "meta": md_list[0]}]
+            return [{"schema": t.schema, "meta": _meta}]
         else:
             return []
 

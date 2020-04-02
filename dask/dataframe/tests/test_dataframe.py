@@ -5,13 +5,14 @@ from operator import add
 import pytest
 import numpy as np
 import pandas as pd
-import pandas.util.testing as tm
 from pandas.io.formats import format as pandas_format
 
 import dask
 import dask.array as da
 from dask.array.numpy_compat import _numpy_118
 import dask.dataframe as dd
+from dask.dataframe import _compat
+from dask.dataframe._compat import tm, PANDAS_GT_100
 from dask.base import compute_as_if_collection
 from dask.utils import put_lines, M
 
@@ -35,6 +36,33 @@ dsk = {
 meta = make_meta({"a": "i8", "b": "i8"}, index=pd.Index([], "i8"))
 d = dd.DataFrame(dsk, "x", meta, [0, 5, 9, 9])
 full = d.compute()
+
+
+def test_dataframe_doc():
+    doc = d.add.__doc__
+    disclaimer = "Some inconsistencies with the Dask version may exist."
+    assert disclaimer in doc
+
+
+def test_dataframe_doc_from_non_pandas():
+    class Foo:
+        def foo(self):
+            """This is a new docstring that I just made up
+
+            Parameters:
+            ----------
+            None
+            """
+
+    d._bind_operator_method("foo", Foo.foo, original=Foo)
+    try:
+        doc = d.foo.__doc__
+        disclaimer = "Some inconsistencies with the Dask version may exist."
+        assert disclaimer in doc
+        assert "new docstring that I just made up" in doc
+    finally:
+        # make sure to clean up this alteration of the dd.DataFrame class
+        del dd.DataFrame.foo
 
 
 def test_Dataframe():
@@ -152,6 +180,14 @@ def test_Scalar():
     assert repr(s) == "dd.Scalar<a, type=Timestamp>"
 
 
+def test_scalar_raises():
+    val = np.int64(1)
+    s = Scalar({("a", 0): val}, "a", "i8")
+    msg = "cannot be converted to a boolean value"
+    with pytest.raises(TypeError, match=msg):
+        bool(s)
+
+
 def test_attributes():
     assert "a" in dir(d)
     assert "foo" not in dir(d)
@@ -163,7 +199,7 @@ def test_attributes():
     assert "a" in dir(df)
     assert 5 not in dir(df)
 
-    df = dd.from_pandas(tm.makeTimeDataFrame(), npartitions=3)
+    df = dd.from_pandas(_compat.makeTimeDataFrame(), npartitions=3)
     pytest.raises(AttributeError, lambda: df.foo)
 
 
@@ -336,6 +372,10 @@ def test_describe_numeric(method, test_values):
     assert_eq(df.describe(), ddf.describe(split_every=2, percentiles_method=method))
 
 
+@pytest.mark.xfail(
+    PANDAS_VERSION == "0.24.2",
+    reason="Known bug in Pandas. See https://github.com/pandas-dev/pandas/issues/24011.",
+)
 @pytest.mark.parametrize(
     "include,exclude,percentiles,subset",
     [
@@ -1528,7 +1568,7 @@ def test_dataframe_picklable():
     cloudpickle = pytest.importorskip("cloudpickle")
     cp_dumps = cloudpickle.dumps
 
-    d = tm.makeTimeDataFrame()
+    d = _compat.makeTimeDataFrame()
     df = dd.from_pandas(d, npartitions=3)
     df = df + 2
 
@@ -1562,11 +1602,19 @@ def test_random_partitions():
     assert isinstance(a, dd.DataFrame)
     assert isinstance(b, dd.DataFrame)
     assert a._name != b._name
+    np.testing.assert_array_equal(a.index, sorted(a.index))
 
     assert len(a.compute()) + len(b.compute()) == len(full)
     a2, b2 = d.random_split([0.5, 0.5], 42)
     assert a2._name == a._name
     assert b2._name == b._name
+
+    a, b = d.random_split([0.5, 0.5], 42, True)
+    a2, b2 = d.random_split([0.5, 0.5], 42, True)
+    assert_eq(a, a2)
+    assert_eq(b, b2)
+    with pytest.raises(AssertionError):
+        np.testing.assert_array_equal(a.index, sorted(a.index))
 
     parts = d.random_split([0.4, 0.5, 0.1], 42)
     names = set([p._name for p in parts])
@@ -1762,7 +1810,7 @@ def test_repartition_partition_size(use_index, n, partition_size, transform):
     a = dd.from_pandas(df, npartitions=n, sort=use_index)
     b = a.repartition(partition_size=partition_size)
     assert_eq(a, b, check_divisions=False)
-    assert np.alltrue(b.map_partitions(total_mem_usage).compute() <= 1024)
+    assert np.alltrue(b.map_partitions(total_mem_usage, deep=True).compute() <= 1024)
     parts = dask.get(b.dask, b.__dask_keys__())
     assert all(map(len, parts))
 
@@ -1912,7 +1960,7 @@ def test_embarrassingly_parallel_operations():
 
 
 def test_fillna():
-    df = tm.makeMissingDataframe(0.8, 42)
+    df = _compat.makeMissingDataframe()
     ddf = dd.from_pandas(df, npartitions=5, sort=False)
 
     assert_eq(ddf.fillna(100), df.fillna(100))
@@ -1944,7 +1992,8 @@ def test_fillna():
     pytest.raises(NotImplementedError, lambda: ddf.fillna(0, limit=10))
     pytest.raises(NotImplementedError, lambda: ddf.fillna(0, limit=10, axis=1))
 
-    df = tm.makeMissingDataframe(0.2, 42)
+    df = _compat.makeMissingDataframe()
+    df.iloc[:15, 0] = np.nan  # all NaN partition
     ddf = dd.from_pandas(df, npartitions=5, sort=False)
     pytest.raises(ValueError, lambda: ddf.fillna(method="pad").compute())
     assert_eq(df.fillna(method="pad", limit=3), ddf.fillna(method="pad", limit=3))
@@ -1961,7 +2010,7 @@ def test_fillna_duplicate_index():
 
 
 def test_fillna_multi_dataframe():
-    df = tm.makeMissingDataframe(0.8, 42)
+    df = _compat.makeMissingDataframe()
     ddf = dd.from_pandas(df, npartitions=5, sort=False)
 
     assert_eq(ddf.A.fillna(ddf.B), df.A.fillna(df.B))
@@ -1969,7 +2018,7 @@ def test_fillna_multi_dataframe():
 
 
 def test_ffill_bfill():
-    df = tm.makeMissingDataframe(0.8, 42)
+    df = _compat.makeMissingDataframe()
     ddf = dd.from_pandas(df, npartitions=5, sort=False)
 
     assert_eq(ddf.ffill(), df.ffill())
@@ -2101,14 +2150,15 @@ def test_select_dtypes(include, exclude):
 
     tm.assert_series_equal(result.dtypes.value_counts(), expected.dtypes.value_counts())
 
-    if PANDAS_VERSION >= "0.23.0":
+    if not PANDAS_GT_100:
+        # removed in pandas 1.0
         ctx = pytest.warns(FutureWarning)
-    else:
-        ctx = pytest.warns(None)
 
-    with ctx:
-        tm.assert_series_equal(a.get_ftype_counts(), df.get_ftype_counts())
-        tm.assert_series_equal(result.get_ftype_counts(), expected.get_ftype_counts())
+        with ctx:
+            tm.assert_series_equal(a.get_ftype_counts(), df.get_ftype_counts())
+            tm.assert_series_equal(
+                result.get_ftype_counts(), expected.get_ftype_counts()
+            )
 
 
 def test_deterministic_apply_concat_apply_names():
@@ -2590,7 +2640,7 @@ def test_round():
 
 def test_cov():
     # DataFrame
-    df = pd.util.testing.makeMissingDataframe(0.3, 42)
+    df = _compat.makeMissingDataframe()
     ddf = dd.from_pandas(df, npartitions=6)
 
     res = ddf.cov()
@@ -2632,7 +2682,7 @@ def test_cov():
 
 def test_corr():
     # DataFrame
-    df = pd.util.testing.makeMissingDataframe(0.3, 42)
+    df = _compat.makeMissingDataframe()
     ddf = dd.from_pandas(df, npartitions=6)
 
     res = ddf.corr()
@@ -2680,7 +2730,7 @@ def test_corr():
 def test_corr_same_name():
     # Series with same names (see https://github.com/dask/dask/issues/4906)
 
-    df = pd.util.testing.makeMissingDataframe(0.3, 42)
+    df = _compat.makeMissingDataframe()
     ddf = dd.from_pandas(df, npartitions=6)
 
     result = ddf.A.corr(ddf.B.rename("A"))
@@ -2793,7 +2843,7 @@ def test_apply_infer_columns():
 
 
 def test_index_time_properties():
-    i = tm.makeTimeSeries()
+    i = _compat.makeTimeSeries()
     a = dd.from_pandas(i, npartitions=3)
 
     assert "day" in dir(a.index)
@@ -2961,8 +3011,8 @@ def test_astype_categoricals_known():
     )
     ddf = dd.from_pandas(df, 2)
 
-    abc = pd.api.types.CategoricalDtype(["a", "b", "c"])
-    category = pd.api.types.CategoricalDtype()
+    abc = pd.api.types.CategoricalDtype(["a", "b", "c"], ordered=False)
+    category = pd.api.types.CategoricalDtype(ordered=False)
 
     # DataFrame
     ddf2 = ddf.astype({"x": abc, "y": category, "z": "category", "other": "f8"})
@@ -3013,9 +3063,11 @@ def _assert_info(df, ddf, memory_usage=True):
     stdout_pd = buf_pd.getvalue()
     stdout_da = buf_da.getvalue()
     stdout_da = stdout_da.replace(str(type(ddf)), str(type(df)))
+    # TODO
     assert stdout_pd == stdout_da
 
 
+@pytest.mark.skipif(not dd._compat.PANDAS_GT_100, reason="Changed info repr")
 def test_info():
     from io import StringIO
 
@@ -3050,6 +3102,7 @@ def test_info():
     assert ddf.info(buf=None) is None
 
 
+@pytest.mark.skipif(not dd._compat.PANDAS_GT_100, reason="Changed info repr")
 def test_groupby_multilevel_info():
     # GH 1844
     from io import StringIO
@@ -3085,6 +3138,7 @@ def test_groupby_multilevel_info():
     assert buf.getvalue() == expected
 
 
+@pytest.mark.skipif(not dd._compat.PANDAS_GT_100, reason="Changed info repr")
 def test_categorize_info():
     # assert that we can call info after categorize
     # workaround for: https://github.com/pydata/pandas/issues/14368
@@ -3105,9 +3159,11 @@ def test_categorize_info():
         "<class 'dask.dataframe.core.DataFrame'>\n"
         "Int64Index: 4 entries, 0 to 3\n"
         "Data columns (total 3 columns):\n"
-        "x    4 non-null int64\n"
-        "y    4 non-null category\n"
-        "z    4 non-null object\n"
+        " #   Column  Non-Null Count  Dtype\n"
+        "---  ------  --------------  -----\n"
+        " 0   x       4 non-null      int64\n"
+        " 1   y       4 non-null      category\n"
+        " 2   z       4 non-null      object\n"
         "dtypes: category(1), object(1), int64(1)"
     )
     assert buf.getvalue() == expected
@@ -3123,7 +3179,7 @@ def test_gh_1301():
 
 
 def test_timeseries_sorted():
-    df = tm.makeTimeDataFrame()
+    df = _compat.makeTimeDataFrame()
     ddf = dd.from_pandas(df.reset_index(), npartitions=2)
     df.index.name = "index"
     assert_eq(ddf.set_index("index", sorted=True, drop=True), df)
@@ -3355,7 +3411,7 @@ def test_diff():
 
 
 def test_shift():
-    df = tm.makeTimeDataFrame()
+    df = _compat.makeTimeDataFrame()
     ddf = dd.from_pandas(df, npartitions=4)
 
     # DataFrame
@@ -3378,8 +3434,8 @@ def test_shift():
 
 @pytest.mark.parametrize("data_freq,divs1", [("B", False), ("D", True), ("H", True)])
 def test_shift_with_freq_DatetimeIndex(data_freq, divs1):
-    df = tm.makeTimeDataFrame(30)
-    df = df.set_index(tm.makeDateIndex(30, freq=data_freq))
+    df = _compat.makeTimeDataFrame()
+    df = df.set_index(_compat.makeDateIndex(30, freq=data_freq))
     ddf = dd.from_pandas(df, npartitions=4)
     for freq, divs2 in [("S", True), ("W", False), (pd.Timedelta(10, unit="h"), True)]:
         for d, p in [(ddf, df), (ddf.A, df.A), (ddf.index, df.index)]:
@@ -3394,7 +3450,7 @@ def test_shift_with_freq_DatetimeIndex(data_freq, divs1):
 
 @pytest.mark.parametrize("data_freq,divs", [("B", False), ("D", True), ("H", True)])
 def test_shift_with_freq_PeriodIndex(data_freq, divs):
-    df = tm.makeTimeDataFrame(30)
+    df = _compat.makeTimeDataFrame()
     # PeriodIndex
     df = df.set_index(pd.period_range("2000-01-01", periods=30, freq=data_freq))
     ddf = dd.from_pandas(df, npartitions=4)
@@ -3407,16 +3463,16 @@ def test_shift_with_freq_PeriodIndex(data_freq, divs):
     assert_eq(res, df.index.shift(2))
     assert res.known_divisions == divs
 
-    df = tm.makeTimeDataFrame(30)
+    df = _compat.makeTimeDataFrame()
     with pytest.raises(ValueError):
         ddf.index.shift(2, freq="D")  # freq keyword not supported
 
 
 def test_shift_with_freq_TimedeltaIndex():
-    df = tm.makeTimeDataFrame(30)
+    df = _compat.makeTimeDataFrame()
     # TimedeltaIndex
     for data_freq in ["T", "D", "H"]:
-        df = df.set_index(tm.makeTimedeltaIndex(30, freq=data_freq))
+        df = df.set_index(_compat.makeTimedeltaIndex(30, freq=data_freq))
         ddf = dd.from_pandas(df, npartitions=4)
         for freq in ["S", pd.Timedelta(10, unit="h")]:
             for d, p in [(ddf, df), (ddf.A, df.A), (ddf.index, df.index)]:
@@ -3431,7 +3487,7 @@ def test_shift_with_freq_TimedeltaIndex():
 
 def test_shift_with_freq_errors():
     # Other index types error
-    df = tm.makeDataFrame()
+    df = _compat.makeDataFrame()
     ddf = dd.from_pandas(df, npartitions=4)
     pytest.raises(NotImplementedError, lambda: ddf.shift(2, freq="S"))
     pytest.raises(NotImplementedError, lambda: ddf.A.shift(2, freq="S"))
@@ -3564,6 +3620,34 @@ def test_memory_usage(index, deep):
         df.x.memory_usage(index=index, deep=deep)
         == ddf.x.memory_usage(index=index, deep=deep).compute()
     )
+
+
+@pytest.mark.parametrize("index", [True, False])
+@pytest.mark.parametrize("deep", [True, False])
+def test_memory_usage_per_partition(index, deep):
+    df = pd.DataFrame(
+        {
+            "x": [1, 2, 3, 4, 5],
+            "y": [1.0, 2.0, 3.0, 4.0, 5.0],
+            "z": ["a", "b", "c", "d", "e"],
+        }
+    )
+    ddf = dd.from_pandas(df, npartitions=2)
+
+    # DataFrame.memory_usage_per_partition
+    expected = pd.Series(
+        part.compute().memory_usage(index=index, deep=deep).sum()
+        for part in ddf.partitions
+    )
+    result = ddf.memory_usage_per_partition(index=index, deep=deep)
+    assert_eq(expected, result)
+
+    # Series.memory_usage_per_partition
+    expected = pd.Series(
+        part.x.compute().memory_usage(index=index, deep=deep) for part in ddf.partitions
+    )
+    result = ddf.x.memory_usage_per_partition(index=index, deep=deep)
+    assert_eq(expected, result)
 
 
 @pytest.mark.parametrize(
@@ -3973,13 +4057,13 @@ def test_scalar_with_array():
 
 def test_has_parallel_type():
     assert has_parallel_type(pd.DataFrame())
-    assert has_parallel_type(pd.Series())
+    assert has_parallel_type(pd.Series(dtype=float))
     assert not has_parallel_type(123)
 
 
 def test_meta_error_message():
     with pytest.raises(TypeError) as info:
-        dd.DataFrame({("x", 1): 123}, "x", pd.Series(), [None, None])
+        dd.DataFrame({("x", 1): 123}, "x", pd.Series(dtype=float), [None, None])
 
     assert "Series" in str(info.value)
     assert "DataFrame" in str(info.value)
@@ -4118,9 +4202,25 @@ def test_pop():
 
 
 def test_simple_map_partitions():
-    df = pd.DataFrame({"x": range(10), "y": range(10)})
+    data = {"col_0": [9, -3, 0, -1, 5], "col_1": [-2, -7, 6, 8, -5]}
+    df = pd.DataFrame(data)
     ddf = dd.from_pandas(df, npartitions=2)
-    ddf = ddf.drop("x", axis=1)
+    ddf = ddf.clip(-4, 6)
     task = ddf.__dask_graph__()[ddf.__dask_keys__()[0]]
     [v] = task[0].dsk.values()
-    assert v[0] == M.drop or v[1] == M.drop
+    assert v[0] == M.clip or v[1] == M.clip
+
+
+def test_iter():
+    df = pd.DataFrame({"A": [1, 2, 3, 4], "B": [1, 2, 3, 4]})
+    ddf = dd.from_pandas(df, 2)
+
+    assert list(df) == list(ddf)
+    for col, expected in zip(ddf, ["A", "B"]):
+        assert col == expected
+
+
+def test_dataframe_groupby_agg_empty_partitions():
+    df = pd.DataFrame({"x": [1, 2, 3, 4, 5, 6, 7, 8]})
+    ddf = dd.from_pandas(df, npartitions=4)
+    assert_eq(ddf[ddf.x < 5].x.cumsum(), df[df.x < 5].x.cumsum())

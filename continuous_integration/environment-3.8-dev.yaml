@@ -4,7 +4,7 @@ channels:
   - conda-forge
 dependencies:
   # required dependencies
-  - python=3.7.*
+  - python=3.8.*
   # For the dependencies. These will be re-installed later.
   - numpy
   - pandas
@@ -32,7 +32,7 @@ dependencies:
   - cloudpickle
   - crick
   - cytoolz
-  - distributed==2.0.1
+  - distributed
   - graphviz
   - ipython
   - lz4
@@ -47,8 +47,6 @@ dependencies:
   - python-snappy
   - cachey
   - python-graphviz
+  - python-xxhash
+  - mmh3
   - pip
-  - pip:
-      - cityhash
-      - mmh3
-      - xxhash
